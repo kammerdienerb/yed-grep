@@ -135,7 +135,7 @@ void grep_run(void) {
         goto empty;
     }
 
-    if (status != 0) {
+    if (status != 0 && status != 2) {
 empty:;
         yed_buff_clear_no_undo(get_or_make_buff());
     }
