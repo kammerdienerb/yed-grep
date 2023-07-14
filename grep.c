@@ -174,7 +174,7 @@ void grep_select(void) {
 
     sscanf(array_data(line->chars) + row_idx, "%d", &row);
 
-    YEXE("special-buffer-prepare-jump-focus", "*grep-list");
+    YEXE("special-buffer-prepare-jump-focus", path);
     YEXE("buffer", path);
     yed_set_cursor_within_frame(ys->active_frame, row, 1);
     grep_cleanup();
