@@ -30,7 +30,6 @@ void grep_run(void);
 void grep_select(void);
 
 void grep_key_pressed_handler(yed_event *event);
-void grep_sig_handler(yed_event *event);
 void grep_pump_handler(yed_event *event);
 
 static void *grep_run_thread(void *arg);
@@ -68,10 +67,6 @@ int yed_plugin_boot(yed_plugin *self) {
 
     h.kind = EVENT_KEY_PRESSED;
     h.fn   = grep_key_pressed_handler;
-    yed_plugin_add_event_handler(self, h);
-
-    h.kind = EVENT_SIGNAL_RECEIVED;
-    h.fn   = grep_sig_handler;
     yed_plugin_add_event_handler(self, h);
 
     h.kind = EVENT_PRE_PUMP;
@@ -185,6 +180,23 @@ static void *grep_run_thread(void *arg) {
     int           n_read;
     char          buff[4096];
 
+
+#define CLEANUP_CURRENT(status_ptr)  \
+do {                                 \
+    if (pid != 0) {                  \
+        kill(-pid, SIGKILL);         \
+        waitpid(pid, status_ptr, 0); \
+        close(pipe_fds[0]);          \
+        pid = 0;                     \
+        errno = 0;                   \
+    }                                \
+                                     \
+    cmd_running      = 0;            \
+    cmd_output_ready = 0;            \
+} while (0)
+
+
+
     (void)arg;
 
     pid = 0;
@@ -204,26 +216,38 @@ static void *grep_run_thread(void *arg) {
             }
         }
 
-#define CLEANUP_CURRENT()      \
-do {                           \
-    if (pid != 0) {            \
-        kill(pid, SIGKILL);    \
-        waitpid(pid, NULL, 0); \
-        close(pipe_fds[0]);    \
-        close(pipe_fds[1]);    \
-        pid = 0;               \
-        errno = 0;             \
-    }                          \
-                               \
-    cmd_running      = 0;      \
-    cmd_output_ready = 0;      \
-} while (0)
+
+        if (pid != 0) {
+            if (pfds[1].revents & POLLIN) {
+
+    #define MAX_POLL_READ (16386)
+
+                pthread_mutex_lock(&mtx);
+                total_read = 0;
+                errno = 0;
+                while (total_read < MAX_POLL_READ && (n_read = read(pipe_fds[0], buff, sizeof(buff))) > 0) {
+                    array_push_n(cmd_output, buff, n_read);
+                    total_read += n_read;
+                }
+                if (n_read <= 0 && errno != EWOULDBLOCK) {
+                    write(control_pipe[1], "w", 1);
+                    errno = 0;
+                }
+                pthread_mutex_unlock(&mtx);
+
+            }
+
+            if (pfds[1].revents & POLLERR || pfds[1].revents & POLLHUP) {
+                write(control_pipe[1], "w", 1);
+            }
+        }
+
 
         if (pfds[0].revents & POLLIN) {
             while (read(pfds[0].fd, &control, 1) > 0) {
                 switch (control) {
                     case 'r':
-                        CLEANUP_CURRENT();
+                        CLEANUP_CURRENT(NULL);
 
                         if (pipe(pipe_fds)) {
                             goto out;
@@ -231,19 +255,22 @@ do {                           \
                         fcntl(pipe_fds[0], F_SETFL, fcntl(pipe_fds[0], F_GETFL) | O_NONBLOCK);
 
                         pfds[1].fd      = pipe_fds[0];
-                        pfds[1].events  = POLLIN;
+                        pfds[1].events  = POLLIN | POLLERR | POLLHUP;
                         pfds[1].revents = 0;
 
                         pthread_mutex_lock(&mtx);
 
                         pid = fork();
                         if (pid == 0) {
+                            setpgid(0, 0);
+
                             while ((dup2(pipe_fds[1], 1) == -1) && (errno == EINTR)) {}
                             close(pipe_fds[0]);
                             close(pipe_fds[1]);
                             execl("/bin/sh", "sh", "-c", cmd_to_run, NULL);
                             exit(123);
                         } else {
+                            setpgid(pid, pid);
                             close(pipe_fds[1]);
                         }
 
@@ -257,11 +284,10 @@ do {                           \
                         break;
 
                     case 'w':
-                        if (pid != 0 && waitpid(pid, &status, WNOHANG)) {
+                        if (pid != 0) {
+                            CLEANUP_CURRENT(&status);
                             if (WIFEXITED(status)) {
                                 cmd_status = WEXITSTATUS(status);
-                                CLEANUP_CURRENT();
-
                                 cmd_output_ready = 1;
                                 yed_force_update();
                             }
@@ -269,35 +295,15 @@ do {                           \
                         break;
 
                     case 'c':
-                        CLEANUP_CURRENT();
+                        CLEANUP_CURRENT(NULL);
                         break;
 
                     case 's':
-                        CLEANUP_CURRENT();
+                        CLEANUP_CURRENT(NULL);
                         goto out;
                         break;
 
                 }
-            }
-        }
-
-        if (pfds[1].revents & POLLIN) {
-
-#define MAX_POLL_READ (16386)
-
-            pthread_mutex_lock(&mtx);
-            total_read = 0;
-            while (total_read < MAX_POLL_READ && (n_read = read(pipe_fds[0], buff, sizeof(buff))) > 0) {
-                array_push_n(cmd_output, buff, n_read);
-                total_read += n_read;
-            }
-            pthread_mutex_unlock(&mtx);
-
-            if (n_read <= 0) {
-                if (errno != EWOULDBLOCK) {
-                    write(control_pipe[1], "w", 1);
-                }
-                errno = 0;
             }
         }
     }
@@ -404,12 +410,6 @@ void grep_key_pressed_handler(yed_event *event) {
     grep_select();
 
     event->cancel = 1;
-}
-
-void grep_sig_handler(yed_event *event) {
-    if (event->signum != SIGCHLD) { return; }
-
-    write(control_pipe[1], "w", 1);
 }
 
 void grep_pump_handler(yed_event *event) {
